@@ -14,7 +14,8 @@ Wraps WhatsApp Web's official VoIP WASM stack and uses [Baileys](https://github.
 - ✅ Mute / unmute / hang up
 - ❌ Group calls
 - ❌ Video
-- ❌ Inbound calls
+- ✅ Inbound calls (`client.on("incoming")`, `call.accept()` / `call.reject()`) — experimental
+- ✅ Real-time uplink via `audioSource: "stream"` + `call.sendAudio()` / `call.clearAudio()`
 
 ## Requirements
 

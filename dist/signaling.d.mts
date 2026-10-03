@@ -19,8 +19,24 @@ export type BaileysSocket = {
     ws: any;
     ev: any;
 };
+/** Metadata of an inbound `offer` stanza, surfaced before it reaches the WASM. */
+export type IncomingOfferInfo = {
+    callId: string;
+    /** JID that sent the offer (usually `<lid>:<device>@lid`). */
+    peerJid: string;
+    /** `call-creator` attr — the caller's account JID. */
+    callCreator: string;
+    /** Caller phone-number JID when WhatsApp includes it (`caller_pn`). */
+    callerPn?: string;
+    /** Push name when present (`notify`). */
+    notify?: string;
+    isVideo: boolean;
+    offline: boolean;
+};
 export type SignalingBridgeConfig = {
     sock: BaileysSocket;
+    /** Called for every inbound offer, right before it is handed to the WASM. */
+    onIncomingOffer?: (info: IncomingOfferInfo) => void;
 };
 export declare class SignalingBridge {
     #private;

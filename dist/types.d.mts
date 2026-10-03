@@ -14,13 +14,27 @@ export type AudioConfig = {
 export type CallOptions = {
     /** Phone number, digits only (e.g. `"12345678901"`). */
     to: string;
-    /** Audio source: file path to MP3/WAV, or `"silence"` for an empty uplink. */
+    /** Audio source: file path to MP3/WAV, `"silence"`, or `"stream"` (feed via `call.sendAudio`). */
     audioSource?: string;
     /** Auto-hangup after N ms (default: 120000). */
     durationMs?: number;
 };
+export type CallDirection = "incoming" | "outgoing";
+/** Caller details for an inbound call. */
+export type IncomingCallInfo = {
+    callId: string;
+    /** Caller JID (often a `@lid` JID). */
+    from: string;
+    /** Caller phone number (digits) when WhatsApp discloses it. */
+    fromPhone?: string;
+    pushName?: string;
+    isVideo: boolean;
+    offline: boolean;
+};
 /** Events emitted by an `ActiveCall`. */
 export type CallEvents = {
+    /** Raw WASM call state change. */
+    state: (state: CallState) => void;
     ringing: () => void;
     connected: () => void;
     /** 16 kHz mono Float32 PCM frame from the remote peer. */
@@ -33,6 +47,12 @@ export type CallEvents = {
 export type VoipSdkConfig = {
     /** Path to a Baileys multi-file auth state directory. */
     authDir: string;
+    /** Print the pairing QR in the terminal (default: true). Listen to `client.on("qr")` to render it yourself. */
+    printQrInTerminal?: boolean;
+    /** Uplink source for inbound calls (default `"stream"` — feed via `call.sendAudio`). */
+    incomingAudioSource?: string;
+    /** Auto-hangup inbound calls N ms after they are answered (default: 0 = never). */
+    incomingDurationMs?: number;
 };
 /** Mirrors the WhatsApp WASM `CallState` enum. */
 export declare const CallState: {

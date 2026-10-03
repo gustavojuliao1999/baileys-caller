@@ -8,6 +8,8 @@
  * @author ShellTear
  */
 
+import { debug } from "./debug.mjs";
+
 export type BaileysSocket = {
   authState: any;
   signalRepository: any;
@@ -21,8 +23,25 @@ export type BaileysSocket = {
   ev: any;
 };
 
+/** Metadata of an inbound `offer` stanza, surfaced before it reaches the WASM. */
+export type IncomingOfferInfo = {
+  callId: string;
+  /** JID that sent the offer (usually `<lid>:<device>@lid`). */
+  peerJid: string;
+  /** `call-creator` attr — the caller's account JID. */
+  callCreator: string;
+  /** Caller phone-number JID when WhatsApp includes it (`caller_pn`). */
+  callerPn?: string;
+  /** Push name when present (`notify`). */
+  notify?: string;
+  isVideo: boolean;
+  offline: boolean;
+};
+
 export type SignalingBridgeConfig = {
   sock: BaileysSocket;
+  /** Called for every inbound offer, right before it is handed to the WASM. */
+  onIncomingOffer?: (info: IncomingOfferInfo) => void;
 };
 
 const S_WHATSAPP_NET = "@s.whatsapp.net";
@@ -63,6 +82,24 @@ const removeNodeChildrenByTag = (node: any, tag: string): void => {
   setNodeChildren(node, getNodeChildren(node).filter((c: any) => c.tag !== tag));
 };
 
+/**
+ * Baileys decodes an AD_JID with device 0 as `user@lid` and re-encodes that as a
+ * JID_PAIR, which the WASM parses as `user:0@s.whatsapp.net`. The stack then sees
+ * the call creator (PN) differ from the peer (LID) and silently drops the offer
+ * ("mismatched peer id and creator id"). Pin `:0` so LID JIDs round-trip as AD_JID.
+ */
+const BARE_LID_JID = /^[^:@_]+@(lid|hosted\.lid)$/;
+const pinLidDevices = (node: any): void => {
+  if (!node || typeof node !== "object") return;
+  for (const [key, value] of Object.entries(node.attrs ?? {})) {
+    if (typeof value === "string" && BARE_LID_JID.test(value)) {
+      const at = value.indexOf("@");
+      node.attrs[key] = `${value.slice(0, at)}:0${value.slice(at)}`;
+    }
+  }
+  if (Array.isArray(node.content)) for (const child of node.content) pinLidDevices(child);
+};
+
 const parseCountAttr = (value: unknown, fallback = 0): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -70,6 +107,7 @@ const parseCountAttr = (value: unknown, fallback = 0): number => {
 
 export class SignalingBridge {
   readonly #sock: BaileysSocket;
+  readonly #onIncomingOffer?: (info: IncomingOfferInfo) => void;
   #baileys: any = null;
   #voip: any = null;
 
@@ -80,12 +118,15 @@ export class SignalingBridge {
   readonly #remoteObfuscatedPeerByCallId = new Map<string, string>();
   readonly #remoteXmppRoutePeerByCallId = new Map<string, string>();
   readonly #incomingCallPeerById = new Map<string, string>();
+  /** Calls placed by our own account from another device (e.g. the phone). */
+  readonly #ownCallIds = new Set<string>();
 
   #outgoingSignalingQueue = Promise.resolve<void>(undefined);
   #incomingSignalingQueue = Promise.resolve<void>(undefined);
 
   constructor(config: SignalingBridgeConfig) {
     this.#sock = config.sock;
+    this.#onIncomingOffer = config.onIncomingOffer;
   }
 
   /** Hand the WASM engine in so we can dispatch ack callbacks back to it. */
@@ -112,19 +153,19 @@ export class SignalingBridge {
   sendSignaling = (peerJid: string, callId: string, xmlPayload: Uint8Array): void => {
     this.#outgoingSignalingQueue = this.#outgoingSignalingQueue
       .then(() => this.#doSendSignaling(peerJid, callId, xmlPayload))
-      .catch(() => {});
+      .catch((err) => debug("send signaling failed:", err?.message ?? err));
   };
 
   processIncomingCall = (node: any, voip: any, activeCallId: string): void => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
-      .catch(() => {});
+      .catch((err) => debug("incoming call stanza failed:", err?.message ?? err));
   };
 
   processIncomingReceipt = (node: any, voip: any, activeCallId: string): void => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingReceipt(node, voip, activeCallId))
-      .catch(() => {});
+      .catch((err) => debug("incoming receipt failed:", err?.message ?? err));
   };
 
   requestTcToken = async (jid: string): Promise<Uint8Array | undefined> => {
@@ -232,6 +273,7 @@ export class SignalingBridge {
 
     const signalingTag = String(voipNode.tag);
     const effectivePeerJid = this.#resolveOutboundPeerJid(callId, peerJid);
+    debug(`-> ${signalingTag} call=${callId} peer=${effectivePeerJid}`);
 
     if (signalingTag === "offer" && !voipNode.attrs["call-creator"]) {
       const selfLid = this.#sock.authState.creds.me?.lid;
@@ -313,6 +355,7 @@ export class SignalingBridge {
     void (async () => {
       try {
         const ackNode = await this.#sock.waitForMessage(stanzaId, ACK_TIMEOUT_MS);
+        debug(`   ack for ${signalingTag}: ${ackNode?.attrs?.error ? `ERROR ${ackNode.attrs.error}` : "ok"}`);
         if (!ackNode || !this.#voip) return;
         const { encodeBinaryNode } = this.#baileys;
         const ackPayload = Buffer.from(encodeBinaryNode(ackNode)).toString("base64");
@@ -340,7 +383,27 @@ export class SignalingBridge {
 
     const incomingCallId = String(voipChild.attrs["call-id"] ?? voipChild.attrs.call_id ?? "");
     const callIdForRouting = incomingCallId || activeCallId;
-    if (activeCallId && incomingCallId && incomingCallId !== activeCallId) return;
+    debug(`<- ${voipChild.tag} call=${incomingCallId} from=${node.attrs.from} creator=${voipChild.attrs["call-creator"] ?? ""}` +
+      `${node.attrs.offline !== undefined || voipChild.attrs.offline !== undefined ? ` offline=${node.attrs.offline ?? voipChild.attrs.offline}` : ""}` +
+      ` active=${activeCallId || "-"}`);
+    if (activeCallId && incomingCallId && incomingCallId !== activeCallId) {
+      debug(`   ignored: another call (${activeCallId}) is active`);
+      return;
+    }
+
+    // WhatsApp fans our own outgoing calls (placed from the phone or another
+    // companion) out to every device of the account. They aren't calls *to* us:
+    // drop them, and everything that follows for that call id.
+    if (incomingCallId && this.#ownCallIds.has(incomingCallId)) {
+      if (voipChild.tag === "terminate") this.#ownCallIds.delete(incomingCallId);
+      return;
+    }
+    if (voipChild.tag === "offer" && incomingCallId !== activeCallId &&
+        this.#isOwnAccount(String(voipChild.attrs["call-creator"] ?? ""))) {
+      debug("   ignored: call placed by our own account from another device");
+      this.#ownCallIds.add(incomingCallId);
+      return;
+    }
 
     const senderDeviceJid =
       String(voipChild.attrs.participant ?? "") ||
@@ -359,6 +422,7 @@ export class SignalingBridge {
       usableNode = await this.#maybeDecryptEnc(voipChild, senderDeviceJid);
     }
 
+    pinLidDevices(usableNode);
     const b64 = Buffer.from(encodeBinaryNode(usableNode)).toString("base64");
 
     const storedPeerJid = callIdForRouting ? this.#incomingCallPeerById.get(callIdForRouting) : undefined;
@@ -385,6 +449,17 @@ export class SignalingBridge {
 
     switch (usableNode.tag) {
       case "offer":
+        try {
+          this.#onIncomingOffer?.({
+            callId: callIdForRouting,
+            peerJid: routedPeerJid,
+            callCreator: String(voipChild.attrs["call-creator"] ?? callbackPeerJid),
+            callerPn: voipChild.attrs.caller_pn ?? node.attrs.caller_pn ?? undefined,
+            notify: node.attrs.notify ?? voipChild.attrs.notify ?? undefined,
+            isVideo: !!getBinaryNodeChild(usableNode, "video"),
+            offline,
+          });
+        } catch {}
         voip.handleSignalingOffer({
           payload: b64,
           peerPlatform: Number(platform || 0),
@@ -433,6 +508,7 @@ export class SignalingBridge {
     const incomingCallId = String(receiptChild.attrs["call-id"] ?? receiptChild.attrs.call_id ?? "");
     const callIdForRouting = incomingCallId || activeCallId;
     if (activeCallId && incomingCallId && incomingCallId !== activeCallId) return;
+    if (incomingCallId && this.#ownCallIds.has(incomingCallId)) return;
 
     const callbackPeerJid = String(node.attrs.from ?? receiptChild.attrs["call-creator"] ?? "");
     const storedPeerJid = callIdForRouting ? this.#incomingCallPeerById.get(callIdForRouting) : undefined;
@@ -440,6 +516,7 @@ export class SignalingBridge {
     if (callIdForRouting && routedPeerJid) this.#incomingCallPeerById.set(callIdForRouting, routedPeerJid);
 
     const tcToken = await this.ensureTcToken(routedPeerJid, callbackPeerJid);
+    pinLidDevices(node);
     voip.handleSignalingReceipt({
       payload: Buffer.from(encodeBinaryNode(node)).toString("base64"),
       peerJid: routedPeerJid,
@@ -553,6 +630,14 @@ export class SignalingBridge {
   };
 
   // ─── private — JID utilities ──────────────────────────────────────────────
+
+  /** True when `jid` belongs to the linked account itself (PN or LID, any device). */
+  #isOwnAccount = (jid: string): boolean => {
+    const user = this.#baileys.jidDecode(jid)?.user;
+    if (!user) return false;
+    const me = this.#sock.authState.creds.me;
+    return [me?.id, me?.lid].some((own) => own && this.#baileys.jidDecode(own)?.user === user);
+  };
 
   #toBareJid = (jid: string): string => {
     const { jidDecode, jidEncode } = this.#baileys;

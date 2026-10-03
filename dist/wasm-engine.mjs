@@ -437,6 +437,16 @@ export class WasmEngine {
         this.#ensureInitialized();
         this.#instance.endCall(reason, sendTerminate);
     };
+    /** Accept the currently ringing inbound call. */
+    acceptCall = (isMicEnabled = true, isCameraEnabled = false) => {
+        this.#ensureInitialized();
+        this.#instance.acceptCall(isMicEnabled, isCameraEnabled);
+    };
+    /** Reject the currently ringing inbound call. */
+    rejectCall = () => {
+        this.#ensureInitialized();
+        this.#instance.rejectCall();
+    };
     setMute = (muted) => {
         this.#ensureInitialized();
         return this.#instance.setCallMute(muted);

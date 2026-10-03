@@ -59,6 +59,10 @@ export declare class WasmEngine {
         extraData?: Uint8Array;
     }) => unknown;
     endCall: (reason?: number, sendTerminate?: boolean) => void;
+    /** Accept the currently ringing inbound call. */
+    acceptCall: (isMicEnabled?: boolean, isCameraEnabled?: boolean) => void;
+    /** Reject the currently ringing inbound call. */
+    rejectCall: () => void;
     setMute: (muted: boolean) => number;
     updateNetworkMedium: (networkMedium: number, networkMtu?: number) => void;
     handleSignalingOffer: (msg: {

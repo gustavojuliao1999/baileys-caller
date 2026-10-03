@@ -17,7 +17,8 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
-import { CallState } from "./types.mjs";
+import { debug, DEBUG, DEBUG_WASM } from "./debug.mjs";
+import { CallState, } from "./types.mjs";
 export { CallState } from "./types.mjs";
 const SHA256_LEN = 32;
 const loadBaileys = async () => {
@@ -57,6 +58,23 @@ const computeHmacSha256 = (data, key) => {
     const result = createHmac("sha256", Buffer.from(key)).update(data).digest();
     return new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
 };
+/**
+ * Numbers to try for a dial string. Brazil (+55) mobiles gained a leading 9 in
+ * 2012–2016, but many WhatsApp accounts are still registered without it (and a
+ * few the other way round), so try the alternate form too.
+ */
+export const phoneNumberCandidates = (digits) => {
+    const out = [digits];
+    if (digits.startsWith("55") && (digits.length === 12 || digits.length === 13)) {
+        const ddd = digits.slice(2, 4);
+        const local = digits.slice(4);
+        if (local.length === 9 && local[0] === "9")
+            out.push(`55${ddd}${local.slice(1)}`);
+        else if (local.length === 8 && /[6-9]/.test(local[0]))
+            out.push(`55${ddd}9${local}`);
+    }
+    return out;
+};
 const isCallReceiptNode = (node) => {
     if (node?.tag !== "receipt")
         return false;
@@ -67,35 +85,87 @@ const isCallReceiptNode = (node) => {
 export class ActiveCall extends EventEmitter {
     callId;
     engine;
+    direction;
     #state = CallState.Idle;
     #endResolver;
     #endPromise;
     #endTimer = null;
+    #durationMs;
     #ended = false;
+    #answered = false;
+    #feeder = null;
+    #prebuffer = [];
     /** @internal mirrors the source path for the audio feeder */
     _audioSource = "silence";
-    constructor(callId, engine, durationMs) {
+    /** Set for inbound calls. */
+    incoming;
+    /** Outbound: the number actually dialed (may differ from the input, e.g. BR 9th digit). */
+    remoteNumber;
+    constructor(callId, engine, durationMs, direction = "outgoing", incoming = null) {
         super();
         this.callId = callId;
         this.engine = engine;
+        this.direction = direction;
+        this.incoming = incoming;
         this.#endPromise = new Promise((res) => { this.#endResolver = res; });
-        if (durationMs > 0) {
-            this.#endTimer = setTimeout(() => this.end(), durationMs);
-        }
+        // Swallow unhandled "error" events so a missing listener can't crash the process.
+        this.on("error", () => { });
+        this.#durationMs = durationMs;
+        // Outbound: limit starts now. Inbound: limit starts once answered.
+        if (direction === "outgoing")
+            this.#armEndTimer();
     }
     get state() { return this.#state; }
+    get ended() { return this.#ended; }
+    /** Answer a ringing inbound call. */
+    accept = () => {
+        if (this.direction !== "incoming" || this.#ended || this.#answered)
+            return;
+        this.#answered = true;
+        debug(`accept call=${this.callId} (state=${this.#state})`);
+        this.engine.acceptCall(true, false);
+        this.#armEndTimer();
+    };
+    /** Decline a ringing inbound call. */
+    reject = () => {
+        if (this.direction !== "incoming" || this.#ended || this.#answered)
+            return;
+        try {
+            this.engine.rejectCall();
+        }
+        catch { }
+        this._forceEnd("rejected");
+    };
+    /**
+     * Send PCM to the peer (Float32 in [-1, 1], 16 kHz mono). Only works when
+     * the call was created with `audioSource: "stream"`. Audio pushed before the
+     * uplink opens is buffered.
+     */
+    sendAudio = (pcm) => {
+        if (this.#ended)
+            return;
+        if (this.#feeder)
+            this.#feeder.push(pcm);
+        else
+            this.#prebuffer.push(pcm.slice());
+    };
+    /** Discard queued outbound audio (barge-in). */
+    clearAudio = () => {
+        this.#prebuffer = [];
+        this.#feeder?.clear();
+    };
+    /** Milliseconds of outbound audio still queued. */
+    get queuedAudioMs() { return this.#feeder?.queuedMs ?? 0; }
     end = () => {
         if (this.#ended)
             return;
-        this.#ended = true;
-        if (this.#endTimer) {
-            clearTimeout(this.#endTimer);
-            this.#endTimer = null;
-        }
+        // Sends <terminate> to the peer. Don't mark #ended before _forceEnd, or the
+        // "ended" event never fires and the client keeps the call as active.
         try {
             this.engine.endCall(0, true);
         }
         catch { }
+        this._forceEnd("hangup");
     };
     mute = (muted) => {
         try {
@@ -106,17 +176,51 @@ export class ActiveCall extends EventEmitter {
     waitForEnd = () => this.#endPromise;
     /** @internal — called by VoipClient on WASM call-state change */
     _updateState = (state) => {
+        const prev = this.#state;
+        if (state === prev)
+            return;
+        debug(`call=${this.callId} state ${prev} -> ${state}`);
         this.#state = state;
+        this.emit("state", state);
         if (state === CallState.PreacceptReceived)
             this.emit("ringing");
         else if (state === CallState.Active)
             this.emit("connected");
-        else if (state === CallState.Idle || state === CallState.Ending) {
+        else if (state === CallState.Ending || (state === CallState.Idle && prev !== CallState.Idle)) {
             this._forceEnd("ended");
         }
     };
+    /**
+     * @internal — media started flowing (capture/playback opened by the WASM).
+     * For an answered inbound call that proves the call is up even if the
+     * "Active" state event never arrives, so report it as connected.
+     */
+    _mediaStarted = (source) => {
+        debug(`call=${this.callId} media started (${source}) state=${this.#state} answered=${this.#answered}`);
+        if (this.#ended || this.direction !== "incoming" || !this.#answered)
+            return;
+        if (this.#state === CallState.Active)
+            return;
+        this.#state = CallState.Active;
+        this.emit("state", CallState.Active);
+        this.emit("connected");
+    };
+    /** @internal — the WASM reuses its playback buffer, so hand out a copy. */
+    _emitAudio = (pcm) => { this.emit("audio", pcm.slice()); };
     /** @internal */
-    _emitAudio = (pcm) => { this.emit("audio", pcm); };
+    _attachFeeder = (feeder) => {
+        this.#feeder = feeder;
+        if (!feeder)
+            return;
+        for (const chunk of this.#prebuffer)
+            feeder.push(chunk);
+        this.#prebuffer = [];
+    };
+    #armEndTimer = () => {
+        if (this.#durationMs > 0 && !this.#endTimer) {
+            this.#endTimer = setTimeout(() => this.end(), this.#durationMs);
+        }
+    };
     /** @internal */
     _forceEnd = (reason) => {
         if (this.#ended)
@@ -130,8 +234,17 @@ export class ActiveCall extends EventEmitter {
         this.#endResolver(reason);
     };
 }
-/** Top-level client. Connects to WhatsApp and lets you place calls. */
-export class VoipClient {
+/**
+ * Top-level client. Connects to WhatsApp and lets you place and receive calls.
+ *
+ * Events:
+ *   - `incoming` (call: ActiveCall) — an inbound call is ringing; call
+ *     `call.accept()` or `call.reject()`.
+ *   - `busy` (info: IncomingCallInfo) — an inbound offer arrived while another
+ *     call was active and was ignored.
+ *   - `qr` (qr: string) — pairing QR payload (refreshes every ~20 s until scanned).
+ */
+export class VoipClient extends EventEmitter {
     #config;
     #engine = null;
     #relay = null;
@@ -147,8 +260,13 @@ export class VoipClient {
     #captureFramesPerChunk = 320;
     #feeder = null;
     constructor(config) {
+        super();
         this.#config = config;
     }
+    /** JID of the linked account once connected (e.g. `5511999999999:12@s.whatsapp.net`). */
+    get selfJid() { return this.#sock?.authState?.creds?.me?.id; }
+    /** The call currently in progress (or ringing), if any. */
+    get activeCall() { return this.#activeCall; }
     /** Connect to WhatsApp and bring up the WASM VoIP stack. */
     connect = async () => {
         this.#baileys = await loadBaileys();
@@ -166,8 +284,16 @@ export class VoipClient {
             error: () => { },
             fatal: () => { },
         };
+        // The WA Web version bundled with Baileys goes stale and the server then
+        // refuses the login ("Connection Failure" / 405) — always use the latest.
+        let version;
+        try {
+            ({ version } = await this.#baileys.fetchLatestBaileysVersion());
+        }
+        catch { }
         const createSocket = () => makeSocket({
             auth: state,
+            ...(version ? { version } : {}),
             emitOwnEvents: true,
             logger: silentLogger,
         });
@@ -192,12 +318,15 @@ export class VoipClient {
                 });
                 this.#sock.ev.on("connection.update", (update) => {
                     if (update.qr) {
-                        void import("qrcode-terminal")
-                            .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
-                            .catch(() => {
-                            console.log("Scan this QR code in WhatsApp > Linked Devices:");
-                            console.log(update.qr);
-                        });
+                        this.emit("qr", update.qr);
+                        if (this.#config.printQrInTerminal !== false) {
+                            void import("qrcode-terminal")
+                                .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
+                                .catch(() => {
+                                console.log("Scan this QR code in WhatsApp > Linked Devices:");
+                                console.log(update.qr);
+                            });
+                        }
                     }
                     if (update.connection === "open") {
                         opened = true;
@@ -220,7 +349,10 @@ export class VoipClient {
             };
             connectSocket();
         });
-        this.#signaling = new SignalingBridge({ sock: this.#sock });
+        this.#signaling = new SignalingBridge({
+            sock: this.#sock,
+            onIncomingOffer: (info) => this.#handleIncomingOffer(info),
+        });
         await this.#signaling.init();
         this.#relay = new RelayRtcTransport({
             onTransportMessage: (data, ip, port) => this.#engine?.handleOnTransportMessage(data, ip, port),
@@ -230,11 +362,17 @@ export class VoipClient {
             callbacks: {
                 onSignalingXmpp: (peerJid, callId, xmlPayload) => this.#signaling.sendSignaling(peerJid, callId, xmlPayload),
                 onCallEvent: (eventType, eventData) => this.#handleCallEvent(eventType, eventData),
+                // VOIP_DEBUG=1: avisos/erros do WASM; VOIP_DEBUG=wasm: tudo.
+                onLog: DEBUG
+                    ? (level, msg) => { if (DEBUG_WASM || level === "error" || level === "warn")
+                        debug(`[wasm:${level}]`, msg); }
+                    : undefined,
                 sendDataToRelay: (data, ip, port) => this.#relay.send(data, ip, port),
                 onAudioCaptureInit: (config) => this.#handleAudioCaptureInit(config),
                 onAudioCaptureStart: () => this.#handleAudioCaptureStart(),
                 onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
                 onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
+                onAudioPlaybackStart: () => this.#activeCall?._mediaStarted("playback"),
                 cryptoHkdf: computeHkdf,
                 hmacSha256: computeHmacSha256,
             },
@@ -264,13 +402,9 @@ export class VoipClient {
             throw new Error("Not connected. Call connect() first.");
         if (this.#activeCall)
             throw new Error("A call is already active.");
-        const targetNumber = phoneNumber.replace(/\D/g, "");
-        const targetPnJid = `${targetNumber}@s.whatsapp.net`;
         const durationMs = opts.durationMs ?? 120_000;
         const audioSource = opts.audioSource ?? "silence";
-        const peerLid = await this.#signaling.resolveLid(targetPnJid);
-        if (!peerLid)
-            throw new Error(`Could not resolve LID for ${targetPnJid}`);
+        const { number: targetNumber, pnJid: targetPnJid, lid: peerLid } = await this.#resolveTarget(phoneNumber.replace(/\D/g, ""));
         for (const jid of [targetPnJid, peerLid]) {
             try {
                 await this.#sock.presenceSubscribe(jid);
@@ -287,7 +421,8 @@ export class VoipClient {
         const callId = ("00" + randomBytes(16).toString("hex").slice(2)).toUpperCase();
         const call = new ActiveCall(callId, this.#engine, durationMs);
         call._audioSource = audioSource;
-        this.#activeCall = call;
+        call.remoteNumber = targetNumber;
+        this.#trackCall(call);
         this.#engine.startCall({
             peerJid: peerLid,
             peerPn: targetPnJid,
@@ -299,6 +434,22 @@ export class VoipClient {
             extraData: tcToken,
         });
         return call;
+    };
+    /**
+     * Unlink this device from the WhatsApp account (it disappears from
+     * "Linked devices" on the phone), then tear everything down. The auth state
+     * becomes useless afterwards — delete `authDir` before connecting again.
+     * Note: the WASM stack can't be re-initialised in the same process, so start
+     * a new process to pair again.
+     */
+    logout = async () => {
+        this.#activeCall?.end();
+        try {
+            await this.#sock?.logout?.();
+        }
+        finally {
+            this.disconnect();
+        }
     };
     /** Tear down the WhatsApp socket and release resources. */
     disconnect = () => {
@@ -313,7 +464,76 @@ export class VoipClient {
         this.#sock = null;
     };
     // ─── private ──────────────────────────────────────────────────────────────
+    /**
+     * Find the WhatsApp account behind a phone number. Brazilian mobiles may be
+     * registered with or without the extra 9th digit, so both forms are tried.
+     */
+    #resolveTarget = async (digits) => {
+        const candidates = phoneNumberCandidates(digits);
+        for (const candidate of candidates) {
+            let pnJid = `${candidate}@s.whatsapp.net`;
+            try {
+                const [result] = (await this.#sock.onWhatsApp(pnJid)) ?? [];
+                if (result && !result.exists) {
+                    debug(`${candidate} is not on WhatsApp`);
+                    continue;
+                }
+                if (result?.jid)
+                    pnJid = toBareJid(String(result.jid));
+            }
+            catch (err) {
+                debug(`onWhatsApp(${candidate}) failed: ${err?.message ?? err}`);
+            }
+            const lid = await this.#signaling.resolveLid(pnJid).catch(() => undefined);
+            if (lid) {
+                const number = pnJid.split("@")[0];
+                if (number !== digits)
+                    debug(`dialing ${number} instead of ${digits}`);
+                return { number, pnJid, lid };
+            }
+            debug(`could not resolve LID for ${pnJid}`);
+        }
+        throw new Error(`O número ${digits} não foi encontrado no WhatsApp` +
+            (candidates.length > 1 ? ` (tentado também ${candidates.slice(1).join(", ")})` : ""));
+    };
+    #trackCall = (call) => {
+        this.#activeCall = call;
+        call.once("ended", () => {
+            if (this.#activeCall === call)
+                this.#activeCall = null;
+        });
+    };
+    #handleIncomingOffer = (offer) => {
+        debug(`incoming offer call=${offer.callId} creator=${offer.callCreator} pn=${offer.callerPn ?? "-"} offline=${offer.offline}`);
+        if (!this.#engine || !offer.callId)
+            return;
+        const info = {
+            callId: offer.callId,
+            from: offer.callCreator || offer.peerJid,
+            fromPhone: offer.callerPn ? offer.callerPn.split("@")[0].split(":")[0] : undefined,
+            pushName: offer.notify,
+            isVideo: offer.isVideo,
+            offline: offer.offline,
+        };
+        const current = this.#activeCall;
+        if (current) {
+            // Same call re-offered (retransmit) — nothing to do.
+            if (current.callId !== offer.callId)
+                this.emit("busy", info);
+            return;
+        }
+        if (offer.offline)
+            return; // stale offer delivered after reconnect
+        const call = new ActiveCall(offer.callId, this.#engine, this.#config.incomingDurationMs ?? 0, "incoming", info);
+        call._audioSource = this.#config.incomingAudioSource ?? "stream";
+        this.#trackCall(call);
+        // Let the WASM process the offer first so accept()/reject() have a call context.
+        setImmediate(() => { if (!call.ended)
+            this.emit("incoming", call); });
+    };
     #handleCallEvent = (eventType, eventData) => {
+        if (eventType !== 156)
+            debug(`wasm event ${eventType}${eventData ? ` ${eventData.slice(0, 300)}` : ""}`);
         if (eventType === 16 && eventData) {
             try {
                 const parsed = JSON.parse(eventData);
@@ -331,7 +551,11 @@ export class VoipClient {
             catch { }
         }
         else if (eventType === 2) {
-            this.#activeCall?._forceEnd("remote_end");
+            // For inbound calls the WASM fires event 2 right after the offer creates
+            // the call (state ReceivedCall) — it is not an end signal there. The real
+            // end arrives as a state change to Idle/Ending, handled above.
+            if (this.#activeCall?.direction === "outgoing")
+                this.#activeCall._forceEnd("remote_end");
         }
     };
     #handleAudioCaptureInit = (config) => {
@@ -345,6 +569,7 @@ export class VoipClient {
         this.#capturePtr = this.#engine.malloc(this.#captureChunkBytes);
     };
     #handleAudioCaptureStart = () => {
+        this.#activeCall?._mediaStarted("capture");
         if (!this.#engine || !this.#capturePtr)
             return;
         const audioSource = this.#activeCall?._audioSource ?? "silence";
@@ -353,8 +578,10 @@ export class VoipClient {
                 this.#engine.sendAudioData(chunk, this.#capturePtr);
         }, audioSource);
         this.#feeder.start();
+        this.#activeCall?._attachFeeder(this.#feeder);
     };
     #handleAudioCaptureStop = () => {
+        this.#activeCall?._attachFeeder(null);
         this.#feeder?.stop();
         this.#feeder = null;
         if (this.#engine && this.#capturePtr) {
