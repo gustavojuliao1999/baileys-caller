@@ -265,6 +265,14 @@ export class VoipClient extends EventEmitter {
     }
     /** JID of the linked account once connected (e.g. `5511999999999:12@s.whatsapp.net`). */
     get selfJid() { return this.#sock?.authState?.creds?.me?.id; }
+    /**
+     * The underlying Baileys socket (null until connected). Use it for messages
+     * and anything else besides calls — never open a second socket with the same
+     * auth, WhatsApp keeps only one connection per linked device.
+     */
+    get socket() { return this.#sock; }
+    /** The loaded Baileys module (helpers such as `downloadMediaMessage`). */
+    get baileys() { return this.#baileys; }
     /** The call currently in progress (or ringing), if any. */
     get activeCall() { return this.#activeCall; }
     /** Connect to WhatsApp and bring up the WASM VoIP stack. */
