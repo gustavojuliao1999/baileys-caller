@@ -376,6 +376,16 @@ export class VoipClient extends EventEmitter {
               rejectOpen(update.lastDisconnect?.error ?? new Error("socket closed before open"));
             }
           }
+          if (update.connection === "close" && opened) {
+            // Dropped after being connected (network, server restart, logged out from the phone).
+            // The WASM stack can't be re-attached to a new socket: callers should restart.
+            const statusCode = update.lastDisconnect?.error?.output?.statusCode;
+            this.emit("connection-lost", {
+              statusCode,
+              loggedOut: statusCode === DisconnectReason?.loggedOut,
+              error: update.lastDisconnect?.error?.message,
+            });
+          }
         });
       };
 
