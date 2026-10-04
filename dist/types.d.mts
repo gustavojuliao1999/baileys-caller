@@ -53,6 +53,12 @@ export type VoipSdkConfig = {
     incomingAudioSource?: string;
     /** Auto-hangup inbound calls N ms after they are answered (default: 0 = never). */
     incomingDurationMs?: number;
+    /**
+     * Extra options for Baileys' `makeWASocket` (e.g. `browser`, `shouldSyncHistoryMessage`).
+     * A function receives the loaded Baileys module (for helpers such as `Browsers`).
+     * `auth`, `version` and `logger` are always set by the client.
+     */
+    socketOptions?: Record<string, unknown> | ((baileys: any) => Record<string, unknown>);
 };
 /** Mirrors the WhatsApp WASM `CallState` enum. */
 export declare const CallState: {

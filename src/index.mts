@@ -319,10 +319,14 @@ export class VoipClient extends EventEmitter {
       ({ version } = await this.#baileys.fetchLatestBaileysVersion());
     } catch {}
 
+    const extra = typeof this.#config.socketOptions === "function"
+      ? this.#config.socketOptions(this.#baileys)
+      : this.#config.socketOptions ?? {};
     const createSocket = () => makeSocket({
+      emitOwnEvents: true,
+      ...extra,
       auth: state,
       ...(version ? { version } : {}),
-      emitOwnEvents: true,
       logger: silentLogger,
     });
 
