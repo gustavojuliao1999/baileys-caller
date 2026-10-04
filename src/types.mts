@@ -20,6 +20,8 @@ export type CallOptions = {
   audioSource?: string;
   /** Auto-hangup after N ms (default: 120000). */
   durationMs?: number;
+  /** Start a video call (send frames with `call.sendVideoFrame`). */
+  video?: boolean;
 };
 
 export type CallDirection = "incoming" | "outgoing";
@@ -57,6 +59,17 @@ export type VideoFrame = {
   isKeyFrame: boolean;
 };
 
+/**
+ * The WASM asks for video to send: `camera` (video call) or `screen` (screen share).
+ * Push frames of this size with `call.sendVideoFrame` until `video-capture-stop`.
+ */
+export type VideoCaptureRequest = {
+  kind: "camera" | "screen";
+  width: number;
+  height: number;
+  maxFps: number;
+};
+
 /** Events emitted by an `ActiveCall`. */
 export type CallEvents = {
   /** Raw WASM call state change. */
@@ -67,6 +80,9 @@ export type CallEvents = {
   audio: (pcm: Float32Array) => void;
   /** Decoded video frame from the peer (inbound video calls). */
   video: (frame: VideoFrame) => void;
+  /** The WASM wants video frames (camera or screen share). */
+  "video-capture": (req: VideoCaptureRequest) => void;
+  "video-capture-stop": (kind: "camera" | "screen") => void;
   /** Reason: `"hangup"` | `"timeout"` | `"rejected"` | `"remote_end"` | `"disconnect"` | etc. */
   ended: (reason: string) => void;
   error: (err: Error) => void;

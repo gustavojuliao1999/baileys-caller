@@ -20,11 +20,13 @@ import { SignalingBridge, type IncomingOfferInfo } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
 import { debug, DEBUG, DEBUG_WASM } from "./debug.mjs";
 import {
-  CallState, type VoipSdkConfig, type CallDirection, type IncomingCallInfo, type VideoFrame,
+  CallState, VideoFormat, type VoipSdkConfig, type CallDirection, type IncomingCallInfo, type VideoFrame,
+  type VideoCaptureRequest,
 } from "./types.mjs";
 
 export type {
   VoipSdkConfig, CallOptions, CallEvents, AudioConfig, CallDirection, IncomingCallInfo, VideoFrame,
+  VideoCaptureRequest,
 } from "./types.mjs";
 export { CallState, VideoFormat, VideoOrientation } from "./types.mjs";
 
@@ -138,13 +140,67 @@ export class ActiveCall extends EventEmitter {
   get state(): CallState { return this.#state; }
   get ended(): boolean { return this.#ended; }
 
-  /** Answer a ringing inbound call. */
-  accept = (): void => {
+  /** Answer a ringing inbound call (`camera`: answer sending video). */
+  accept = (opts: { camera?: boolean } = {}): void => {
     if (this.direction !== "incoming" || this.#ended || this.#answered) return;
     this.#answered = true;
-    debug(`accept call=${this.callId} (state=${this.#state})`);
-    this.engine.acceptCall(true, false);
+    debug(`accept call=${this.callId} (state=${this.#state}) camera=${!!opts.camera}`);
+    this.engine.acceptCall(true, !!opts.camera);
     this.#armEndTimer();
+  };
+
+  // ─── video (send) ─────────────────────────────────────────────────────
+
+  /** Current capture the WASM asked for (null = not sending video). */
+  videoCapture: VideoCaptureRequest | null = null;
+
+  /** Turn our camera on: a voice call is upgraded to video first. */
+  startCamera = (): void => {
+    if (this.#ended) return;
+    if (!this.isVideo) { this.engine.requestVideoUpgrade(); this.isVideo = true; }
+    this.engine.setVideoMute(false);
+  };
+  stopCamera = (): void => { if (!this.#ended) this.engine.setVideoMute(true); };
+  /** Share the screen (frames go with `sendVideoFrame` while `videoCapture.kind === "screen"`). */
+  startScreenShare = (width: number, height: number): void => {
+    if (this.#ended) return;
+    if (!this.isVideo) { this.engine.requestVideoUpgrade(); this.isVideo = true; }
+    this.engine.setScreenShareCaptureSize(width, height);
+    this.engine.startScreenShare();
+  };
+  stopScreenShare = (): void => { if (!this.#ended) this.engine.stopScreenShare(); };
+
+  /** Send one raw frame (NV12 by default) for the current capture. */
+  sendVideoFrame = (data: Uint8Array, width: number, height: number, format: number = VideoFormat.NV12): void => {
+    const cap = this.videoCapture;
+    if (this.#ended || !cap) return;
+    if (cap.kind === "screen" && (width !== this.#shareW || height !== this.#shareH)) {
+      this.#shareW = width; this.#shareH = height;
+      this.engine.setScreenShareCaptureSize(width, height);
+    }
+    try {
+      this.engine.sendVideoFrame(cap.kind, data, width, height, cap.maxFps, format);
+    } catch (err) {
+      if (!this.#videoErrorLogged) { this.#videoErrorLogged = true; debug(`sendVideoFrame failed: ${(err as Error)?.message ?? err}`); }
+    }
+  };
+  #shareW = 0;
+  #shareH = 0;
+  #videoErrorLogged = false;
+  /** Video call (offered/answered with video, or upgraded). */
+  isVideo = false;
+
+  /** @internal */
+  _videoCapture = (req: VideoCaptureRequest | null, kind?: "camera" | "screen"): void => {
+    if (req) {
+      debug(`video capture start call=${this.callId} ${req.kind} ${req.width}x${req.height}@${req.maxFps}`);
+      this.videoCapture = req;
+      this.emit("video-capture", req);
+    } else if (!this.videoCapture || this.videoCapture.kind === kind) {
+      debug(`video capture stop call=${this.callId} ${kind}`);
+      this.videoCapture = null;
+      this.emit("video-capture-stop", kind ?? "camera");
+    }
   };
 
   /** Decline a ringing inbound call. */
@@ -408,6 +464,7 @@ export class VoipClient extends EventEmitter {
     this.#signaling = new SignalingBridge({
       sock: this.#sock,
       onIncomingOffer: (info) => this.#handleIncomingOffer(info),
+      onPeerTerminate: (callId) => this.#handlePeerTerminate(callId),
     });
     await this.#signaling.init();
 
@@ -431,6 +488,8 @@ export class VoipClient extends EventEmitter {
         onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
         onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
         onVideoFrame: (frame) => this.#activeCall?._emitVideo(frame),
+        onVideoCaptureStart: (req) => this.#activeCall?._videoCapture(req),
+        onVideoCaptureStop: (kind) => this.#activeCall?._videoCapture(null, kind),
         onAudioPlaybackStart: () => this.#activeCall?._mediaStarted("playback"),
         cryptoHkdf: computeHkdf,
         hmacSha256: computeHmacSha256,
@@ -458,7 +517,7 @@ export class VoipClient extends EventEmitter {
   /** Place an outbound voice call. */
   call = async (
     phoneNumber: string,
-    opts: { audioSource?: string; durationMs?: number } = {},
+    opts: { audioSource?: string; durationMs?: number; video?: boolean } = {},
   ): Promise<ActiveCall> => {
     if (!this.#engine || !this.#signaling) throw new Error("Not connected. Call connect() first.");
     if (this.#activeCall) throw new Error("A call is already active.");
@@ -488,6 +547,7 @@ export class VoipClient extends EventEmitter {
     const call = new ActiveCall(callId, this.#engine, durationMs);
     call._audioSource = audioSource;
     call.remoteNumber = targetNumber;
+    call.isVideo = !!opts.video;
     this.#trackCall(call);
 
     this.#engine.startCall({
@@ -495,7 +555,7 @@ export class VoipClient extends EventEmitter {
       peerPn: targetPnJid,
       peerList: deviceList,
       callId,
-      isVideo: false,
+      isVideo: !!opts.video,
       isLidCall: true,
       isFromDialer: false,
       extraData: tcToken,
@@ -597,9 +657,26 @@ export class VoipClient extends EventEmitter {
       info,
     );
     call._audioSource = this.#config.incomingAudioSource ?? "stream";
+    call.isVideo = !!offer.isVideo;
     this.#trackCall(call);
     // Let the WASM process the offer first so accept()/reject() have a call context.
     setImmediate(() => { if (!call.ended) this.emit("incoming", call); });
+  };
+
+  /**
+   * The peer hung up. The WASM normally moves the call to Ending; in video calls it sometimes
+   * never does, leaving the call "connected" forever. If it hasn't ended shortly after the
+   * peer's terminate, end it here and reset the WASM call state.
+   */
+  #handlePeerTerminate = (callId: string): void => {
+    const call = this.#activeCall;
+    if (!call || call.callId !== callId) return;
+    setTimeout(() => {
+      if (call.ended || this.#activeCall !== call) return;
+      debug(`call=${callId} peer terminated but the WASM did not end it; ending locally`);
+      try { this.#engine?.endCall(0, false); } catch {}
+      call._forceEnd("remote_end");
+    }, 2500);
   };
 
   #handleCallEvent = (eventType: number, eventData?: string): void => {

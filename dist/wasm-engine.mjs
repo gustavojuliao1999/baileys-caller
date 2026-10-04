@@ -40,6 +40,12 @@ const toVideoFrame = (d) => ({
     timestamp: Number(d?.timestamp) || 0,
     isKeyFrame: !!d?.isKeyFrame,
 });
+const toCaptureRequest = (kind, d) => ({
+    kind,
+    width: Number(d?.width) || 640,
+    height: Number(d?.height) || 480,
+    maxFps: Number(d?.max_fps ?? d?.maxFps) || 15,
+});
 const toByteArray = (input) => {
     if (!input)
         return new Uint8Array(0);
@@ -555,6 +561,47 @@ export class WasmEngine {
         }
         catch { }
     };
+    // ─── video (send) ─────────────────────────────────────────────────────
+    #videoBuf = { ptr: 0, size: 0 };
+    /**
+     * Push one raw frame to the encoder: `camera` -> onVideoDataFromJs, `screen` ->
+     * onDesktopCaptureDataFromJs. `format`: VideoFormat (NV12 for the camera).
+     */
+    sendVideoFrame = (kind, data, width, height, fps, format, orientation = 1) => {
+        this.#ensureInitialized();
+        const fn = kind === "screen" ? this.#instance.onDesktopCaptureDataFromJs : this.#instance.onVideoDataFromJs;
+        if (typeof fn !== "function" || !data.byteLength)
+            return;
+        if (this.#videoBuf.size < data.byteLength) {
+            if (this.#videoBuf.ptr)
+                this.free(this.#videoBuf.ptr);
+            this.#videoBuf = { ptr: this.malloc(data.byteLength), size: data.byteLength };
+        }
+        const heapU8 = this.#instance.GROWABLE_HEAP_U8?.() ?? this.#instance.HEAPU8;
+        if (!heapU8 || !this.#videoBuf.ptr)
+            return;
+        heapU8.set(data, this.#videoBuf.ptr);
+        // Same signature fallbacks as the WA Web worker (the binding changed between builds).
+        try {
+            fn.call(this.#instance, this.#videoBuf.ptr, data.byteLength, width, height, fps, format, orientation);
+        }
+        catch (error) {
+            if (error?.name !== "BindingError")
+                throw error;
+            fn.call(this.#instance, this.#videoBuf.ptr, data.byteLength, width, height, fps, format);
+        }
+    };
+    /** Camera on/off during a video call (false = sending video). */
+    setVideoMute = (muted) => { this.#ensureInitialized(); this.#instance.setCallVideoMute?.(muted); };
+    /** Ask to turn a voice call into a video call. */
+    requestVideoUpgrade = () => { this.#ensureInitialized(); this.#instance.requestVideoUpgrade?.(); };
+    startScreenShare = () => { this.#ensureInitialized(); this.#instance.startScreenShare?.(); };
+    stopScreenShare = () => { this.#ensureInitialized(); this.#instance.stopScreenShare?.(); };
+    /** Size of the screen-share frames (call before pushing frames of a new size). */
+    setScreenShareCaptureSize = (width, height) => {
+        this.#ensureInitialized();
+        this.#instance.setScreenShareCaptureSize?.(width, height);
+    };
     malloc = (size) => {
         this.#ensureInitialized();
         return this.#instance._malloc(size);
@@ -786,8 +833,12 @@ export class WasmEngine {
                 });
             });
         }
-        // Decoded frames come from the WASM worker threads.
+        // Decoded frames and capture requests come from the WASM worker threads.
         _a.registerGlobalCallbackListener("onVideoFrameWasmToJs", (data) => callbacks.onVideoFrame?.(toVideoFrame(data)));
+        _a.registerGlobalCallbackListener("startVideoCaptureJS", (d) => callbacks.onVideoCaptureStart?.(toCaptureRequest("camera", d)));
+        _a.registerGlobalCallbackListener("stopVideoCaptureJS", () => callbacks.onVideoCaptureStop?.("camera"));
+        _a.registerGlobalCallbackListener("startDesktopCaptureJS", (d) => callbacks.onVideoCaptureStart?.(toCaptureRequest("screen", d)));
+        _a.registerGlobalCallbackListener("stopDesktopCaptureJS", () => callbacks.onVideoCaptureStop?.("screen"));
         _a.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
         _a.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
         if (callbacks.onAudioPlaybackInit) {
@@ -1012,10 +1063,10 @@ export class WasmEngine {
                 callbacks.onAudioPlaybackStop?.();
                 return 0;
             },
-            startVideoCaptureJS: () => 0,
-            stopVideoCaptureJS: () => 0,
-            startDesktopCaptureJS: () => 0,
-            stopDesktopCaptureJS: () => 0,
+            startVideoCaptureJS: (d) => { callbacks.onVideoCaptureStart?.(toCaptureRequest("camera", d)); return 0; },
+            stopVideoCaptureJS: () => { callbacks.onVideoCaptureStop?.("camera"); return 0; },
+            startDesktopCaptureJS: (d) => { callbacks.onVideoCaptureStart?.(toCaptureRequest("screen", d)); return 0; },
+            stopDesktopCaptureJS: () => { callbacks.onVideoCaptureStop?.("screen"); return 0; },
             dataChannelStateCallback: () => 0,
             getBrowserAudioProcessingStatus: () => 7,
             getBweModelPath: () => null,

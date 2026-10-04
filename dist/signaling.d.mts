@@ -37,6 +37,8 @@ export type SignalingBridgeConfig = {
     sock: BaileysSocket;
     /** Called for every inbound offer, right before it is handed to the WASM. */
     onIncomingOffer?: (info: IncomingOfferInfo) => void;
+    /** The peer ended (terminate) or declined (reject) a call. */
+    onPeerTerminate?: (callId: string) => void;
 };
 export declare class SignalingBridge {
     #private;

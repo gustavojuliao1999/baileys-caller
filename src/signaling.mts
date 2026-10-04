@@ -42,6 +42,8 @@ export type SignalingBridgeConfig = {
   sock: BaileysSocket;
   /** Called for every inbound offer, right before it is handed to the WASM. */
   onIncomingOffer?: (info: IncomingOfferInfo) => void;
+  /** The peer ended (terminate) or declined (reject) a call. */
+  onPeerTerminate?: (callId: string) => void;
 };
 
 const S_WHATSAPP_NET = "@s.whatsapp.net";
@@ -108,6 +110,7 @@ const parseCountAttr = (value: unknown, fallback = 0): number => {
 export class SignalingBridge {
   readonly #sock: BaileysSocket;
   readonly #onIncomingOffer?: (info: IncomingOfferInfo) => void;
+  readonly #onPeerTerminate?: (callId: string) => void;
   #baileys: any = null;
   #voip: any = null;
 
@@ -127,6 +130,7 @@ export class SignalingBridge {
   constructor(config: SignalingBridgeConfig) {
     this.#sock = config.sock;
     this.#onIncomingOffer = config.onIncomingOffer;
+    this.#onPeerTerminate = config.onPeerTerminate;
   }
 
   /** Hand the WASM engine in so we can dispatch ack callbacks back to it. */
@@ -491,6 +495,7 @@ export class SignalingBridge {
           tcToken,
         });
         if (callIdForRouting && (usableNode.tag === "terminate" || usableNode.tag === "reject")) {
+          this.#onPeerTerminate?.(callIdForRouting);
           this.#incomingCallPeerById.delete(callIdForRouting);
           this.#remoteDevicePeerByCallId.delete(callIdForRouting);
           this.#remoteObfuscatedPeerByCallId.delete(callIdForRouting);

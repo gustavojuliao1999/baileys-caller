@@ -1,4 +1,4 @@
-import type { VideoFrame } from "./types.mjs";
+import type { VideoCaptureRequest, VideoFrame } from "./types.mjs";
 export type WasmAudioConfig = {
     sampleRate: number;
     channels: number;
@@ -20,6 +20,9 @@ export type WasmEngineCallbacks = {
     onAudioPlaybackData?: (audioData: Float32Array) => void;
     /** Decoded remote video frame (video calls only). */
     onVideoFrame?: (frame: VideoFrame) => void;
+    /** The WASM asks for camera / screen frames, or stops asking. */
+    onVideoCaptureStart?: (req: VideoCaptureRequest) => void;
+    onVideoCaptureStop?: (kind: "camera" | "screen") => void;
     cryptoHkdf?: (key: Uint8Array, salt: Uint8Array | null, info: Uint8Array, length: number) => Uint8Array;
     hmacSha256?: (data: Uint8Array, key: Uint8Array) => Uint8Array;
 };
@@ -104,6 +107,19 @@ export declare class WasmEngine {
     handleOnTransportMessage: (data: Uint8Array, ip: string, port: number) => void;
     updateIceRtt: (rttMs: number, relayIp: string, relayPort: number) => void;
     sendAudioData: (data: Float32Array, ptr: number) => void;
+    /**
+     * Push one raw frame to the encoder: `camera` -> onVideoDataFromJs, `screen` ->
+     * onDesktopCaptureDataFromJs. `format`: VideoFormat (NV12 for the camera).
+     */
+    sendVideoFrame: (kind: "camera" | "screen", data: Uint8Array, width: number, height: number, fps: number, format: number, orientation?: number) => void;
+    /** Camera on/off during a video call (false = sending video). */
+    setVideoMute: (muted: boolean) => void;
+    /** Ask to turn a voice call into a video call. */
+    requestVideoUpgrade: () => void;
+    startScreenShare: () => void;
+    stopScreenShare: () => void;
+    /** Size of the screen-share frames (call before pushing frames of a new size). */
+    setScreenShareCaptureSize: (width: number, height: number) => void;
     malloc: (size: number) => number;
     free: (ptr: number) => void;
 }

@@ -67,6 +67,7 @@ const parseCountAttr = (value, fallback = 0) => {
 export class SignalingBridge {
     #sock;
     #onIncomingOffer;
+    #onPeerTerminate;
     #baileys = null;
     #voip = null;
     #observedTcTokens = new Map();
@@ -83,6 +84,7 @@ export class SignalingBridge {
     constructor(config) {
         this.#sock = config.sock;
         this.#onIncomingOffer = config.onIncomingOffer;
+        this.#onPeerTerminate = config.onPeerTerminate;
     }
     /** Hand the WASM engine in so we can dispatch ack callbacks back to it. */
     attachEngine = (voip) => {
@@ -414,6 +416,7 @@ export class SignalingBridge {
                     tcToken,
                 });
                 if (callIdForRouting && (usableNode.tag === "terminate" || usableNode.tag === "reject")) {
+                    this.#onPeerTerminate?.(callIdForRouting);
                     this.#incomingCallPeerById.delete(callIdForRouting);
                     this.#remoteDevicePeerByCallId.delete(callIdForRouting);
                     this.#remoteObfuscatedPeerByCallId.delete(callIdForRouting);

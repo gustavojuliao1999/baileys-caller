@@ -13,8 +13,8 @@
 import { EventEmitter } from "node:events";
 import { WasmEngine } from "./wasm-engine.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
-import { CallState, type VoipSdkConfig, type CallDirection, type IncomingCallInfo, type VideoFrame } from "./types.mjs";
-export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig, CallDirection, IncomingCallInfo, VideoFrame, } from "./types.mjs";
+import { CallState, type VoipSdkConfig, type CallDirection, type IncomingCallInfo, type VideoFrame, type VideoCaptureRequest } from "./types.mjs";
+export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig, CallDirection, IncomingCallInfo, VideoFrame, VideoCaptureRequest, } from "./types.mjs";
 export { CallState, VideoFormat, VideoOrientation } from "./types.mjs";
 /**
  * Numbers to try for a dial string. Brazil (+55) mobiles gained a leading 9 in
@@ -37,8 +37,24 @@ export declare class ActiveCall extends EventEmitter {
     constructor(callId: string, engine: WasmEngine, durationMs: number, direction?: CallDirection, incoming?: IncomingCallInfo | null);
     get state(): CallState;
     get ended(): boolean;
-    /** Answer a ringing inbound call. */
-    accept: () => void;
+    /** Answer a ringing inbound call (`camera`: answer sending video). */
+    accept: (opts?: {
+        camera?: boolean;
+    }) => void;
+    /** Current capture the WASM asked for (null = not sending video). */
+    videoCapture: VideoCaptureRequest | null;
+    /** Turn our camera on: a voice call is upgraded to video first. */
+    startCamera: () => void;
+    stopCamera: () => void;
+    /** Share the screen (frames go with `sendVideoFrame` while `videoCapture.kind === "screen"`). */
+    startScreenShare: (width: number, height: number) => void;
+    stopScreenShare: () => void;
+    /** Send one raw frame (NV12 by default) for the current capture. */
+    sendVideoFrame: (data: Uint8Array, width: number, height: number, format?: number) => void;
+    /** Video call (offered/answered with video, or upgraded). */
+    isVideo: boolean;
+    /** @internal */
+    _videoCapture: (req: VideoCaptureRequest | null, kind?: "camera" | "screen") => void;
     /** Decline a ringing inbound call. */
     reject: () => void;
     /**
@@ -102,6 +118,7 @@ export declare class VoipClient extends EventEmitter {
     call: (phoneNumber: string, opts?: {
         audioSource?: string;
         durationMs?: number;
+        video?: boolean;
     }) => Promise<ActiveCall>;
     /**
      * Unlink this device from the WhatsApp account (it disappears from

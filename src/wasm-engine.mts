@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { randomFillSync } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
-import type { VideoFrame } from "./types.mjs";
+import type { VideoCaptureRequest, VideoFrame } from "./types.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,6 +49,13 @@ const toVideoFrame = (d: any): VideoFrame => ({
   isKeyFrame: !!d?.isKeyFrame,
 });
 
+const toCaptureRequest = (kind: "camera" | "screen", d: any): VideoCaptureRequest => ({
+  kind,
+  width: Number(d?.width) || 640,
+  height: Number(d?.height) || 480,
+  maxFps: Number(d?.max_fps ?? d?.maxFps) || 15,
+});
+
 export type WasmEngineCallbacks = {
   onSignalingXmpp?: (peerJid: string, callId: string, xmlPayload: Uint8Array) => void;
   onCallEvent?: (eventType: number, eventData?: string) => void;
@@ -64,6 +71,9 @@ export type WasmEngineCallbacks = {
   onAudioPlaybackData?: (audioData: Float32Array) => void;
   /** Decoded remote video frame (video calls only). */
   onVideoFrame?: (frame: VideoFrame) => void;
+  /** The WASM asks for camera / screen frames, or stops asking. */
+  onVideoCaptureStart?: (req: VideoCaptureRequest) => void;
+  onVideoCaptureStop?: (kind: "camera" | "screen") => void;
   cryptoHkdf?: (key: Uint8Array, salt: Uint8Array | null, info: Uint8Array, length: number) => Uint8Array;
   hmacSha256?: (data: Uint8Array, key: Uint8Array) => Uint8Array;
 };
@@ -635,6 +645,46 @@ export class WasmEngine {
     } catch {}
   };
 
+  // ─── video (send) ─────────────────────────────────────────────────────
+
+  #videoBuf = { ptr: 0, size: 0 };
+
+  /**
+   * Push one raw frame to the encoder: `camera` -> onVideoDataFromJs, `screen` ->
+   * onDesktopCaptureDataFromJs. `format`: VideoFormat (NV12 for the camera).
+   */
+  sendVideoFrame = (kind: "camera" | "screen", data: Uint8Array, width: number, height: number, fps: number, format: number, orientation = 1): void => {
+    this.#ensureInitialized();
+    const fn = kind === "screen" ? this.#instance.onDesktopCaptureDataFromJs : this.#instance.onVideoDataFromJs;
+    if (typeof fn !== "function" || !data.byteLength) return;
+    if (this.#videoBuf.size < data.byteLength) {
+      if (this.#videoBuf.ptr) this.free(this.#videoBuf.ptr);
+      this.#videoBuf = { ptr: this.malloc(data.byteLength), size: data.byteLength };
+    }
+    const heapU8 = this.#instance.GROWABLE_HEAP_U8?.() ?? this.#instance.HEAPU8;
+    if (!heapU8 || !this.#videoBuf.ptr) return;
+    heapU8.set(data, this.#videoBuf.ptr);
+    // Same signature fallbacks as the WA Web worker (the binding changed between builds).
+    try {
+      fn.call(this.#instance, this.#videoBuf.ptr, data.byteLength, width, height, fps, format, orientation);
+    } catch (error: any) {
+      if (error?.name !== "BindingError") throw error;
+      fn.call(this.#instance, this.#videoBuf.ptr, data.byteLength, width, height, fps, format);
+    }
+  };
+
+  /** Camera on/off during a video call (false = sending video). */
+  setVideoMute = (muted: boolean): void => { this.#ensureInitialized(); this.#instance.setCallVideoMute?.(muted); };
+  /** Ask to turn a voice call into a video call. */
+  requestVideoUpgrade = (): void => { this.#ensureInitialized(); this.#instance.requestVideoUpgrade?.(); };
+  startScreenShare = (): void => { this.#ensureInitialized(); this.#instance.startScreenShare?.(); };
+  stopScreenShare = (): void => { this.#ensureInitialized(); this.#instance.stopScreenShare?.(); };
+  /** Size of the screen-share frames (call before pushing frames of a new size). */
+  setScreenShareCaptureSize = (width: number, height: number): void => {
+    this.#ensureInitialized();
+    this.#instance.setScreenShareCaptureSize?.(width, height);
+  };
+
   malloc = (size: number): number => {
     this.#ensureInitialized();
     return this.#instance._malloc(size);
@@ -855,8 +905,12 @@ export class WasmEngine {
       });
     }
 
-    // Decoded frames come from the WASM worker threads.
+    // Decoded frames and capture requests come from the WASM worker threads.
     WasmEngine.registerGlobalCallbackListener("onVideoFrameWasmToJs", (data) => callbacks.onVideoFrame?.(toVideoFrame(data)));
+    WasmEngine.registerGlobalCallbackListener("startVideoCaptureJS", (d) => callbacks.onVideoCaptureStart?.(toCaptureRequest("camera", d)));
+    WasmEngine.registerGlobalCallbackListener("stopVideoCaptureJS", () => callbacks.onVideoCaptureStop?.("camera"));
+    WasmEngine.registerGlobalCallbackListener("startDesktopCaptureJS", (d) => callbacks.onVideoCaptureStart?.(toCaptureRequest("screen", d)));
+    WasmEngine.registerGlobalCallbackListener("stopDesktopCaptureJS", () => callbacks.onVideoCaptureStop?.("screen"));
     WasmEngine.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
     WasmEngine.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
 
@@ -1077,10 +1131,10 @@ export class WasmEngine {
         callbacks.onAudioPlaybackStop?.();
         return 0;
       },
-      startVideoCaptureJS: () => 0,
-      stopVideoCaptureJS: () => 0,
-      startDesktopCaptureJS: () => 0,
-      stopDesktopCaptureJS: () => 0,
+      startVideoCaptureJS: (d: any): number => { callbacks.onVideoCaptureStart?.(toCaptureRequest("camera", d)); return 0; },
+      stopVideoCaptureJS: (): number => { callbacks.onVideoCaptureStop?.("camera"); return 0; },
+      startDesktopCaptureJS: (d: any): number => { callbacks.onVideoCaptureStart?.(toCaptureRequest("screen", d)); return 0; },
+      stopDesktopCaptureJS: (): number => { callbacks.onVideoCaptureStop?.("screen"); return 0; },
       dataChannelStateCallback: () => 0,
       getBrowserAudioProcessingStatus: () => 7,
       getBweModelPath: () => null,
