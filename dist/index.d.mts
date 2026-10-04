@@ -13,9 +13,9 @@
 import { EventEmitter } from "node:events";
 import { WasmEngine } from "./wasm-engine.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
-import { CallState, type VoipSdkConfig, type CallDirection, type IncomingCallInfo } from "./types.mjs";
-export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig, CallDirection, IncomingCallInfo, } from "./types.mjs";
-export { CallState } from "./types.mjs";
+import { CallState, type VoipSdkConfig, type CallDirection, type IncomingCallInfo, type VideoFrame } from "./types.mjs";
+export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig, CallDirection, IncomingCallInfo, VideoFrame, } from "./types.mjs";
+export { CallState, VideoFormat, VideoOrientation } from "./types.mjs";
 /**
  * Numbers to try for a dial string. Brazil (+55) mobiles gained a leading 9 in
  * 2012–2016, but many WhatsApp accounts are still registered without it (and a
@@ -64,6 +64,8 @@ export declare class ActiveCall extends EventEmitter {
     _mediaStarted: (source: string) => void;
     /** @internal — the WASM reuses its playback buffer, so hand out a copy. */
     _emitAudio: (pcm: Float32Array) => void;
+    /** @internal */
+    _emitVideo: (frame: VideoFrame) => void;
     /** @internal */
     _attachFeeder: (feeder: AudioFeeder | null) => void;
     /** @internal */

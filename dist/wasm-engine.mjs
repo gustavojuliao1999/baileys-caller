@@ -30,6 +30,16 @@ const parseJsonObjectEnv = (raw) => {
     catch { }
     return {};
 };
+const toVideoFrame = (d) => ({
+    userJid: d?.userJid,
+    data: d?.frameBuffer instanceof Uint8Array ? d.frameBuffer : new Uint8Array(d?.frameBuffer ?? 0),
+    width: Number(d?.width) || 0,
+    height: Number(d?.height) || 0,
+    format: Number(d?.format ?? -1),
+    orientation: Number(d?.orientation) || 0,
+    timestamp: Number(d?.timestamp) || 0,
+    isKeyFrame: !!d?.isKeyFrame,
+});
 const toByteArray = (input) => {
     if (!input)
         return new Uint8Array(0);
@@ -776,6 +786,8 @@ export class WasmEngine {
                 });
             });
         }
+        // Decoded frames come from the WASM worker threads.
+        _a.registerGlobalCallbackListener("onVideoFrameWasmToJs", (data) => callbacks.onVideoFrame?.(toVideoFrame(data)));
         _a.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
         _a.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
         if (callbacks.onAudioPlaybackInit) {
@@ -1008,6 +1020,7 @@ export class WasmEngine {
             getBrowserAudioProcessingStatus: () => 7,
             getBweModelPath: () => null,
             videoFrameConsumed: () => 0,
+            onVideoFrameWasmToJs: (data) => { callbacks.onVideoFrame?.(toVideoFrame(data)); },
             cryptoHkdfExtractWithSaltAndExpand: (data) => {
                 const key = toByteArray(data?.key_);
                 const salt = data?.salt_ ? toByteArray(data.salt_) : new Uint8Array(0);

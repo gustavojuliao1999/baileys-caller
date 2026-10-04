@@ -20,13 +20,13 @@ import { SignalingBridge, type IncomingOfferInfo } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
 import { debug, DEBUG, DEBUG_WASM } from "./debug.mjs";
 import {
-  CallState, type VoipSdkConfig, type CallDirection, type IncomingCallInfo,
+  CallState, type VoipSdkConfig, type CallDirection, type IncomingCallInfo, type VideoFrame,
 } from "./types.mjs";
 
 export type {
-  VoipSdkConfig, CallOptions, CallEvents, AudioConfig, CallDirection, IncomingCallInfo,
+  VoipSdkConfig, CallOptions, CallEvents, AudioConfig, CallDirection, IncomingCallInfo, VideoFrame,
 } from "./types.mjs";
-export { CallState } from "./types.mjs";
+export { CallState, VideoFormat, VideoOrientation } from "./types.mjs";
 
 const SHA256_LEN = 32;
 
@@ -218,6 +218,15 @@ export class ActiveCall extends EventEmitter {
 
   /** @internal — the WASM reuses its playback buffer, so hand out a copy. */
   _emitAudio = (pcm: Float32Array): void => { this.emit("audio", pcm.slice()); };
+  /** @internal */
+  _emitVideo = (frame: VideoFrame): void => {
+    if (!this.#videoLogged) {
+      this.#videoLogged = true;
+      debug(`video call=${this.callId} first frame ${frame.width}x${frame.height} format=${frame.format} orientation=${frame.orientation}`);
+    }
+    this.emit("video", frame);
+  };
+  #videoLogged = false;
 
   /** @internal */
   _attachFeeder = (feeder: AudioFeeder | null): void => {
@@ -421,6 +430,7 @@ export class VoipClient extends EventEmitter {
         onAudioCaptureStart: () => this.#handleAudioCaptureStart(),
         onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
         onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
+        onVideoFrame: (frame) => this.#activeCall?._emitVideo(frame),
         onAudioPlaybackStart: () => this.#activeCall?._mediaStarted("playback"),
         cryptoHkdf: computeHkdf,
         hmacSha256: computeHmacSha256,

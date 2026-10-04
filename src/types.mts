@@ -36,6 +36,27 @@ export type IncomingCallInfo = {
   offline: boolean;
 };
 
+/** Pixel layout of a decoded video frame (WAWebVoipMediaEnums.WAWebVoipVideoFormat). */
+export const VideoFormat = { NV12: 0, I420: 1, RGB24: 2, RGBA: 3, H264: 100 } as const;
+
+/** Rotation the renderer should apply (WAWebVoipMediaEnums orientation). */
+export const VideoOrientation = { Unknown: 0, Normal: 1, Rotate90: 2, Rotate180: 3, Rotate270: 4 } as const;
+
+/** A decoded video frame from the remote peer (receive-only: the client never sends video). */
+export type VideoFrame = {
+  /** Participant the frame belongs to. */
+  userJid?: string;
+  data: Uint8Array;
+  width: number;
+  height: number;
+  /** See `VideoFormat` (usually I420). */
+  format: number;
+  /** See `VideoOrientation`. */
+  orientation: number;
+  timestamp: number;
+  isKeyFrame: boolean;
+};
+
 /** Events emitted by an `ActiveCall`. */
 export type CallEvents = {
   /** Raw WASM call state change. */
@@ -44,6 +65,8 @@ export type CallEvents = {
   connected: () => void;
   /** 16 kHz mono Float32 PCM frame from the remote peer. */
   audio: (pcm: Float32Array) => void;
+  /** Decoded video frame from the peer (inbound video calls). */
+  video: (frame: VideoFrame) => void;
   /** Reason: `"hangup"` | `"timeout"` | `"rejected"` | `"remote_end"` | `"disconnect"` | etc. */
   ended: (reason: string) => void;
   error: (err: Error) => void;

@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { randomFillSync } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
+import type { VideoFrame } from "./types.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,6 +38,17 @@ export type WasmAudioConfig = {
   framesPerChunk: number;
 };
 
+const toVideoFrame = (d: any): VideoFrame => ({
+  userJid: d?.userJid,
+  data: d?.frameBuffer instanceof Uint8Array ? d.frameBuffer : new Uint8Array(d?.frameBuffer ?? 0),
+  width: Number(d?.width) || 0,
+  height: Number(d?.height) || 0,
+  format: Number(d?.format ?? -1),
+  orientation: Number(d?.orientation) || 0,
+  timestamp: Number(d?.timestamp) || 0,
+  isKeyFrame: !!d?.isKeyFrame,
+});
+
 export type WasmEngineCallbacks = {
   onSignalingXmpp?: (peerJid: string, callId: string, xmlPayload: Uint8Array) => void;
   onCallEvent?: (eventType: number, eventData?: string) => void;
@@ -50,6 +62,8 @@ export type WasmEngineCallbacks = {
   onAudioPlaybackStart?: () => void;
   onAudioPlaybackStop?: () => void;
   onAudioPlaybackData?: (audioData: Float32Array) => void;
+  /** Decoded remote video frame (video calls only). */
+  onVideoFrame?: (frame: VideoFrame) => void;
   cryptoHkdf?: (key: Uint8Array, salt: Uint8Array | null, info: Uint8Array, length: number) => Uint8Array;
   hmacSha256?: (data: Uint8Array, key: Uint8Array) => Uint8Array;
 };
@@ -841,6 +855,8 @@ export class WasmEngine {
       });
     }
 
+    // Decoded frames come from the WASM worker threads.
+    WasmEngine.registerGlobalCallbackListener("onVideoFrameWasmToJs", (data) => callbacks.onVideoFrame?.(toVideoFrame(data)));
     WasmEngine.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
     WasmEngine.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
 
@@ -1069,6 +1085,7 @@ export class WasmEngine {
       getBrowserAudioProcessingStatus: () => 7,
       getBweModelPath: () => null,
       videoFrameConsumed: () => 0,
+      onVideoFrameWasmToJs: (data: any): void => { callbacks.onVideoFrame?.(toVideoFrame(data)); },
       cryptoHkdfExtractWithSaltAndExpand: (data: any): Uint8Array => {
         const key = toByteArray(data?.key_);
         const salt = data?.salt_ ? toByteArray(data.salt_) : new Uint8Array(0);

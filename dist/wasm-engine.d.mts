@@ -1,3 +1,4 @@
+import type { VideoFrame } from "./types.mjs";
 export type WasmAudioConfig = {
     sampleRate: number;
     channels: number;
@@ -17,6 +18,8 @@ export type WasmEngineCallbacks = {
     onAudioPlaybackStart?: () => void;
     onAudioPlaybackStop?: () => void;
     onAudioPlaybackData?: (audioData: Float32Array) => void;
+    /** Decoded remote video frame (video calls only). */
+    onVideoFrame?: (frame: VideoFrame) => void;
     cryptoHkdf?: (key: Uint8Array, salt: Uint8Array | null, info: Uint8Array, length: number) => Uint8Array;
     hmacSha256?: (data: Uint8Array, key: Uint8Array) => Uint8Array;
 };
